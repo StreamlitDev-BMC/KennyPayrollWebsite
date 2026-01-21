@@ -4,4 +4,3 @@ streamlit
 openpyxl
 pytz
 altair<5
-imghdr
