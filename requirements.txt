@@ -1,7 +1,6 @@
 requests
 pandas
-streamlit
+streamlit>=1.28.0
 openpyxl
 pytz
-altair<5
 pillow
