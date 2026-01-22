@@ -164,7 +164,7 @@ api_key_input = st.sidebar.text_input(
 # Ignored user IDs
 ignored_input = st.sidebar.text_input(
     "Ignored User IDs (comma-separated)", 
-    value="1493798,1493810,1493813,1493811,1506767,1601610"
+    value=""
 )
 ignored_user_ids = set()
 for part in ignored_input.split(","):
@@ -1273,4 +1273,5 @@ else:
     - Hours are calculated from the Attendance endpoint (in_time and out_time)
     - All assigned On-Call shifts are counted for flat rate payment (not just attended)
     - Rows with On-Call shifts are highlighted in yellow for easy identification
+
     """)
