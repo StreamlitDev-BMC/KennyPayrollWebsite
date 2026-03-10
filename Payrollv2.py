@@ -1,4 +1,4 @@
-# payroll_export.py - Payroll Export Spreadsheet Generator with On-Call Support
+# payroll_export.py - Payroll Export Spreadsheet Generator with On-Call and Training Support
 
 import os
 import requests
@@ -20,6 +20,7 @@ except AttributeError:
 UK_MINIMUM_WAGE = 12.21  # Rate 2 for overtime
 ON_CALL_ROLE_NAME = "On-Call"
 ON_CALL_FLAT_RATE = 15.00  # £15 per shift
+TRAINING_ROLE_NAME = "Training"  # Role name in RotaCloud for training shifts
 
 
 # --- Helper Functions for Date Management (11th to 10th Monthly Period) ---
@@ -58,7 +59,6 @@ def get_default_payroll_period():
     today = datetime.date.today()
     
     if today.day <= 10:
-        # Period ended on 10th of current month, started 11th of month before that
         if today.month == 1:
             target_month = 12
             target_year = today.year - 1
@@ -66,7 +66,6 @@ def get_default_payroll_period():
             target_month = today.month - 1
             target_year = today.year
     else:
-        # We're past the 10th, so the last completed period ended on 10th of current month
         if today.month == 1:
             target_month = 12
             target_year = today.year - 1
@@ -333,16 +332,18 @@ def get_user_pay_details(user_data):
 def calculate_shift_hours_by_role(shifts_json, user_pay_details, default_hourly_rate, all_custom_roles, role_id_to_name):
     """
     Calculate hours worked, broken down by role rate.
-    EXCLUDES On-Call shifts from the hour calculations (they are added later).
-    Returns: total_hours, hours_at_base_rate, dict of {role_id: (hours, rate, role_name)}, on_call_shifts_list
+    EXCLUDES On-Call and Training shifts from the main hour calculations (they are handled separately).
+    Returns: total_hours, hours_at_base_rate, dict of {role_id: (hours, rate, role_name)},
+             on_call_shifts_list, training_hours (float)
     """
     total_seconds = 0
     base_rate_seconds = 0
     role_hours = {}  # {role_id: {'seconds': 0, 'rate': rate, 'name': name}}
-    on_call_shifts = []  # List of On-Call shift records
+    on_call_shifts = []  # List of On-Call shift records for attendance lookup
+    training_seconds = 0  # Training hours calculated from scheduled shift times
 
     if not shifts_json:
-        return 0.0, 0.0, {}, on_call_shifts
+        return 0.0, 0.0, {}, on_call_shifts, 0.0
 
     role_rates = user_pay_details.get("role_rates", {})
 
@@ -364,22 +365,31 @@ def calculate_shift_hours_by_role(shifts_json, user_pay_details, default_hourly_
         if st_unix is None or en_unix is None:
             continue
 
-        # Check if this is an On-Call shift
+        # --- On-Call: exclude from normal hours, collect for attendance lookup ---
         if role_name == ON_CALL_ROLE_NAME:
             if DEBUG_MODE:
                 st.write(f"   ✅ Found On-Call shift: ID={shift_id}, Role={role_name}")
-            # Store On-Call shift info for separate processing
             on_call_shifts.append({
                 "shift_id": shift_id,
                 "start_time": st_unix,
                 "end_time": en_unix,
                 "minutes_break": minutes_break
             })
-            # Skip this shift from normal hour calculations
             continue
-        elif DEBUG_MODE and role_name:
+
+        # --- Training: exclude from normal hours, accumulate from scheduled times ---
+        if role_name == TRAINING_ROLE_NAME:
+            duration = en_unix - st_unix
+            net_seconds = duration - minutes_break * 60
+            training_seconds += net_seconds
+            if DEBUG_MODE:
+                st.write(f"   📚 Found Training shift: ID={shift_id}, hours={net_seconds/3600:.2f}")
+            continue
+
+        # --- Regular shift ---
+        if DEBUG_MODE and role_name:
             st.write(f"   ℹ️ Regular shift: ID={shift_id}, Role={role_name}")
-        
+
         duration = en_unix - st_unix
         net_seconds = duration - minutes_break * 60
         total_seconds += net_seconds
@@ -388,9 +398,9 @@ def calculate_shift_hours_by_role(shifts_json, user_pay_details, default_hourly_
         if role_id and role_id in role_rates:
             custom_rate = role_rates[role_id]
             if role_id not in role_hours:
-                role_name = get_role_name(role_id)
-                role_hours[role_id] = {'seconds': 0, 'rate': custom_rate, 'name': role_name}
-                all_custom_roles[role_id] = role_name
+                role_name_fetched = get_role_name(role_id)
+                role_hours[role_id] = {'seconds': 0, 'rate': custom_rate, 'name': role_name_fetched}
+                all_custom_roles[role_id] = role_name_fetched
             role_hours[role_id]['seconds'] += net_seconds
         else:
             base_rate_seconds += net_seconds
@@ -398,6 +408,7 @@ def calculate_shift_hours_by_role(shifts_json, user_pay_details, default_hourly_
     # Convert to hours
     total_hours = round(total_seconds / 3600, 2)
     base_rate_hours = round(base_rate_seconds / 3600, 2)
+    training_hours = round(training_seconds / 3600, 2)
     
     role_hours_converted = {}
     for role_id, data in role_hours.items():
@@ -407,7 +418,7 @@ def calculate_shift_hours_by_role(shifts_json, user_pay_details, default_hourly_
             'name': data['name']
         }
     
-    return total_hours, base_rate_hours, role_hours_converted, on_call_shifts
+    return total_hours, base_rate_hours, role_hours_converted, on_call_shifts, training_hours
 
 def unix_to_datetime(unix_ts, timezone_str='Europe/London'):
     """Convert Unix timestamp to timezone-aware datetime."""
@@ -423,7 +434,6 @@ def unix_to_datetime(unix_ts, timezone_str='Europe/London'):
 def calculate_on_call_hours(on_call_shifts, attendance_data):
     """
     Calculate On-Call hours from attendance data using in_time and out_time.
-    Uses a lookup pattern similar to the lateness analysis function.
     Returns: total_on_call_hours, number_of_on_call_shifts (all assigned, not just attended)
     """
     if DEBUG_MODE:
@@ -436,24 +446,20 @@ def calculate_on_call_hours(on_call_shifts, attendance_data):
             st.write("   ⚠️ No On-Call shifts to process")
         return 0.0, 0
 
-    # Count ALL assigned on-call shifts (not just attended ones)
     total_on_call_shifts = len(on_call_shifts)
 
     if not attendance_data:
         if DEBUG_MODE:
             st.write("   ⚠️ No attendance data to process")
-        # Still return the count of shifts, but 0 hours
         return 0.0, total_on_call_shifts
 
     total_on_call_hours = 0.0
 
-    # Build shift lookup: shift_id -> shift details
     shift_lookup = {}
     for shift in on_call_shifts:
         shift_id = shift.get("shift_id")
         if not shift_id:
             continue
-
         shift_lookup[shift_id] = {
             "start_time": shift.get("start_time"),
             "end_time": shift.get("end_time"),
@@ -463,11 +469,8 @@ def calculate_on_call_hours(on_call_shifts, attendance_data):
     if DEBUG_MODE:
         st.write(f"   📋 Built lookup for {len(shift_lookup)} On-Call shifts: {list(shift_lookup.keys())}")
 
-    # Process attendance records with shift lookup
     for attendance in attendance_data:
         if attendance.get("deleted"):
-            if DEBUG_MODE:
-                st.write(f"   ⏭️ Skipping deleted attendance record")
             continue
 
         shift_id = attendance.get("shift")
@@ -477,7 +480,6 @@ def calculate_on_call_hours(on_call_shifts, attendance_data):
         if DEBUG_MODE:
             st.write(f"   🔎 Checking attendance: shift_id={shift_id}, in_time={in_time}, out_time={out_time}")
 
-        # Check if this attendance record corresponds to an On-Call shift
         if shift_id not in shift_lookup:
             if DEBUG_MODE:
                 st.write(f"      ⏭️ Shift {shift_id} not in On-Call lookup")
@@ -492,7 +494,6 @@ def calculate_on_call_hours(on_call_shifts, attendance_data):
             continue
 
         try:
-            # Convert to datetime for better validation
             in_time_dt = unix_to_datetime(in_time)
             out_time_dt = unix_to_datetime(out_time)
 
@@ -500,7 +501,6 @@ def calculate_on_call_hours(on_call_shifts, attendance_data):
                 st.warning(f"Could not convert timestamps for On-Call shift {shift_id}")
                 continue
 
-            # Calculate hours worked from in_time and out_time (Unix timestamps)
             hours_worked = (out_time - in_time) / 3600.0
 
             if DEBUG_MODE:
@@ -508,7 +508,6 @@ def calculate_on_call_hours(on_call_shifts, attendance_data):
                 st.write(f"         Clock in:  {in_time_dt.strftime('%Y-%m-%d %H:%M:%S')}")
                 st.write(f"         Clock out: {out_time_dt.strftime('%Y-%m-%d %H:%M:%S')}")
 
-            # Validate that hours are reasonable (positive and not excessive)
             if hours_worked <= 0:
                 st.warning(f"Invalid On-Call hours for shift {shift_id}: {hours_worked:.2f} hours")
                 continue
@@ -571,13 +570,8 @@ def calculate_fixed_hours(weekly_hours, period_days):
     
     full_weeks = period_days // 7
     remainder_days = period_days % 7
-    
-    # Calculate the hours for the full weeks
     full_weeks_total = full_weeks * weekly_hours
-    
-    # Calculate the proportional hours for the remaining days (e.g., 2/7 of a week)
     proportional_remainder = (remainder_days / 7) * weekly_hours
-    
     fixed_hours = full_weeks_total + proportional_remainder
     
     return round(fixed_hours, 2)
@@ -592,9 +586,10 @@ def create_payroll_excel(payroll_data, start_date, end_date, overtime_rate, all_
     # Styles
     header_font = Font(bold=True, color="FFFFFF")
     header_fill = PatternFill("solid", fgColor="4472C4")
-    salaried_fill = PatternFill("solid", fgColor="E2EFDA")  # Light green for salaried
-    non_standard_rate_fill = PatternFill("solid", fgColor="FCE4D6")  # Light orange for non-standard rate
-    on_call_fill = PatternFill("solid", fgColor="FFF2CC")  # Light yellow for On-Call
+    salaried_fill = PatternFill("solid", fgColor="E2EFDA")        # Light green
+    non_standard_rate_fill = PatternFill("solid", fgColor="FCE4D6")  # Light orange
+    on_call_fill = PatternFill("solid", fgColor="FFF2CC")          # Light yellow
+    training_fill = PatternFill("solid", fgColor="E8D5F5")         # Light purple for training
     currency_format = '£#,##0.00'
     number_format = '#,##0.00'
     thin_border = Border(
@@ -604,7 +599,7 @@ def create_payroll_excel(payroll_data, start_date, end_date, overtime_rate, all_
         bottom=Side(style='thin')
     )
     
-    # Build dynamic headers based on custom roles found
+    # Build dynamic headers
     base_headers = [
         "Employee Name",
         "Pay Type",
@@ -615,19 +610,24 @@ def create_payroll_excel(payroll_data, start_date, end_date, overtime_rate, all_
         "Rate 1 (£)",
     ]
     
-    # Add custom role columns (pairs of Hrs and Rate for each role)
+    # Custom role columns
     custom_role_headers = []
-    sorted_roles = sorted(all_custom_roles.items(), key=lambda x: x[1])  # Sort by role name
+    sorted_roles = sorted(all_custom_roles.items(), key=lambda x: x[1])
     for role_id, role_name in sorted_roles:
-        # Format role names like "Homecare Hrs" and "Homecare Rate (£)"
         custom_role_headers.append(f"{role_name} Hrs")
         custom_role_headers.append(f"{role_name} Rate (£)")
     
-    # On-Call columns (added after custom roles, before overtime)
+    # On-Call columns
     on_call_headers = [
         "On-Call Hrs",
         "On-Call Shifts",
         "On-Call Flat Rate (£)"
+    ]
+
+    # Training columns — hours from scheduled shift times, paid at Rate 1
+    training_headers = [
+        "Training Hrs",
+        "Training Pay (£)"  # Calculated: Training Hrs × Rate 1 (bold, formula)
     ]
     
     end_headers = [
@@ -639,7 +639,7 @@ def create_payroll_excel(payroll_data, start_date, end_date, overtime_rate, all_
         "TOTAL PAY (£)"
     ]
     
-    headers = base_headers + custom_role_headers + on_call_headers + end_headers
+    headers = base_headers + custom_role_headers + on_call_headers + training_headers + end_headers
     
     # Row 1: Period header
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
@@ -656,285 +656,203 @@ def create_payroll_excel(payroll_data, start_date, end_date, overtime_rate, all_
         cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
         cell.border = thin_border
     
-    # Set column widths
+    # Column widths
     ws.column_dimensions['A'].width = 25
     ws.column_dimensions['B'].width = 10
     for col_idx in range(3, len(headers) + 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = 14
     
-    # Calculate column indices for formulas (matching new header order)
-    # A=1: Employee Name
-    # B=2: Pay Type
-    # C=3: Weekly Hrs
-    # D=4: Total Hrs
-    # E=5: Fixed Hrs
-    # F=6: Hours (calculated as MIN(D, E))
-    # G=7: Rate 1 (£)
-    # H=8+: Custom role columns start (Homecare Hrs, Homecare Rate, etc.)
-
+    # --- Column index assignments ---
     weekly_hrs_col = 3   # C
     total_hrs_col = 4    # D
     fixed_hrs_col = 5    # E
-    hours_col = 6        # F (calculated: MIN(Total, Fixed))
+    hours_col = 6        # F
     rate1_col = 7        # G
 
-    # Custom role columns start at column 8 (H)
     custom_role_start_col = 8
     num_custom_role_cols = len(custom_role_headers)
 
-    # On-Call columns follow custom roles
-    on_call_hrs_col = custom_role_start_col + num_custom_role_cols  # After custom roles
-    on_call_shifts_col = on_call_hrs_col + 1
+    on_call_hrs_col       = custom_role_start_col + num_custom_role_cols
+    on_call_shifts_col    = on_call_hrs_col + 1
     on_call_flat_rate_col = on_call_shifts_col + 1
 
-    overtime_hrs_col = on_call_flat_rate_col + 1  # After On-Call
-    rate2_col = overtime_hrs_col + 1
-    holiday_days_col = rate2_col + 1
-    holiday_hrs_col = holiday_days_col + 1
+    training_hrs_col  = on_call_flat_rate_col + 1
+    training_pay_col  = training_hrs_col + 1   # Calculated: Training Hrs × Rate 1
+
+    overtime_hrs_col  = training_pay_col + 1
+    rate2_col         = overtime_hrs_col + 1
+    holiday_days_col  = rate2_col + 1
+    holiday_hrs_col   = holiday_days_col + 1
     sickness_days_col = holiday_hrs_col + 1
-    total_pay_col = sickness_days_col + 1
-    
-    # Data rows start at row 3 (after period header and column headers)
-    data_start_row = 3
-    
-    # Standard rate for highlighting (highlight if NOT this rate and NOT salaried)
+    total_pay_col     = sickness_days_col + 1
+
     STANDARD_RATE = 12.21
+    data_start_row = 3
     
     for row_offset, data in enumerate(payroll_data):
         row_idx = data_start_row + row_offset
         is_salaried = data['pay_type'] == 'annual'
-        
-        # Determine if this row needs highlighting (non-standard rate)
-        # Highlight if hourly and rate_1 is not 12.21
         is_non_standard_rate = not is_salaried and abs(data['rate_1'] - STANDARD_RATE) > 0.01
-        
-        # Has On-Call shifts
         has_on_call = data['on_call_hours'] > 0
-        
-        # Choose fill color (On-Call takes priority for visibility)
+        has_training = data['training_hours'] > 0
+
+        # Row highlight priority: on-call > training > salaried > non-standard rate
         if has_on_call:
             row_fill = on_call_fill
+        elif has_training:
+            row_fill = training_fill
         elif is_salaried:
             row_fill = salaried_fill
         elif is_non_standard_rate:
             row_fill = non_standard_rate_fill
         else:
             row_fill = None
-        
-        # Employee Name
-        cell = ws.cell(row=row_idx, column=1, value=data['employee_name'])
-        cell.border = thin_border
-        if row_fill:
-            cell.fill = row_fill
-        
-        # Pay Type
-        pay_type_display = "Salaried" if is_salaried else "Hourly"
-        cell = ws.cell(row=row_idx, column=2, value=pay_type_display)
-        cell.border = thin_border
-        if row_fill:
-            cell.fill = row_fill
-        
-        # Weekly Hours (contracted weekly hours) - FROM ROTACLOUD
-        cell = ws.cell(row=row_idx, column=weekly_hrs_col, value=data['weekly_hours'])
-        cell.border = thin_border
-        cell.number_format = number_format
-        if row_fill:
-            cell.fill = row_fill
 
-        # Total Hrs - FROM ROTACLOUD (includes on-call for display)
-        cell = ws.cell(row=row_idx, column=total_hrs_col, value=data['total_hours_display'])
-        cell.border = thin_border
-        cell.number_format = number_format
-        if row_fill:
-            cell.fill = row_fill
+        def styled_cell(row, col, value, fmt=None, bold=False):
+            c = ws.cell(row=row, column=col, value=value)
+            c.border = thin_border
+            if row_fill:
+                c.fill = row_fill
+            if fmt:
+                c.number_format = fmt
+            if bold:
+                c.font = Font(bold=True)
+            return c
 
-        # Fixed Hrs - CALCULATED (bold)
-        cell = ws.cell(row=row_idx, column=fixed_hrs_col, value=data['fixed_hours'])
-        cell.border = thin_border
-        cell.number_format = number_format
-        cell.font = Font(bold=True)  # Calculated value
-        if row_fill:
-            cell.fill = row_fill
+        # Basic columns
+        styled_cell(row_idx, 1, data['employee_name'])
+        styled_cell(row_idx, 2, "Salaried" if is_salaried else "Hourly")
+        styled_cell(row_idx, weekly_hrs_col, data['weekly_hours'], number_format)
+        styled_cell(row_idx, total_hrs_col, data['total_hours_display'], number_format)
+        styled_cell(row_idx, fixed_hrs_col, data['fixed_hours'], number_format, bold=True)
 
-        # Hours - CALCULATED as MIN(Total Hrs - On-Call Hrs, Fixed Hrs - On-Call Hrs) (bold)
-        # This represents hours paid at base rate, excluding on-call (which is paid separately)
-        # Formula: MIN(Total - On-Call, Fixed - On-Call)
-        # Example: MIN(200 - 20, 160 - 20) = MIN(180, 140) = 140
-        hours_formula = f"=MIN({get_column_letter(total_hrs_col)}{row_idx}-{get_column_letter(on_call_hrs_col)}{row_idx},{get_column_letter(fixed_hrs_col)}{row_idx}-{get_column_letter(on_call_hrs_col)}{row_idx})"
-        cell = ws.cell(row=row_idx, column=hours_col, value=hours_formula)
-        cell.border = thin_border
-        cell.number_format = number_format
-        cell.font = Font(bold=True)  # Calculated value
+        # Hours = MIN(Total - On-Call, Fixed - On-Call)
+        hours_formula = (
+            f"=MIN({get_column_letter(total_hrs_col)}{row_idx}-{get_column_letter(on_call_hrs_col)}{row_idx}"
+            f"-{get_column_letter(training_hrs_col)}{row_idx},"
+            f"{get_column_letter(fixed_hrs_col)}{row_idx}-{get_column_letter(on_call_hrs_col)}{row_idx}"
+            f"-{get_column_letter(training_hrs_col)}{row_idx})"
+        )
+        c = ws.cell(row=row_idx, column=hours_col, value=hours_formula)
+        c.border = thin_border
+        c.number_format = number_format
+        c.font = Font(bold=True)
         if row_fill:
-            cell.fill = row_fill
+            c.fill = row_fill
 
-        # Rate 1 - FROM ROTACLOUD (or calculated from annual salary)
-        cell = ws.cell(row=row_idx, column=rate1_col, value=data['rate_1'])
-        cell.border = thin_border
-        cell.number_format = currency_format
-        if row_fill:
-            cell.fill = row_fill
-        
+        styled_cell(row_idx, rate1_col, data['rate_1'], currency_format)
+
         # Custom role columns
         col_offset = 0
         for role_id, role_name in sorted_roles:
             hrs_col = custom_role_start_col + col_offset
             rate_col = custom_role_start_col + col_offset + 1
-            
             role_data = data['custom_role_hours'].get(role_id, {'hours': 0, 'rate': 0})
-            
-            cell = ws.cell(row=row_idx, column=hrs_col, value=role_data['hours'])
-            cell.border = thin_border
-            cell.number_format = number_format
-            if row_fill:
-                cell.fill = row_fill
-            
-            cell = ws.cell(row=row_idx, column=rate_col, value=role_data['rate'])
-            cell.border = thin_border
-            cell.number_format = currency_format
-            if row_fill:
-                cell.fill = row_fill
-            
+            styled_cell(row_idx, hrs_col, role_data['hours'], number_format)
+            styled_cell(row_idx, rate_col, role_data['rate'], currency_format)
             col_offset += 2
-        
-        # On-Call Hours - CALCULATED from attendance (bold)
-        cell = ws.cell(row=row_idx, column=on_call_hrs_col, value=data['on_call_hours'])
-        cell.border = thin_border
-        cell.number_format = number_format
-        cell.font = Font(bold=True)  # Calculated value
-        if row_fill:
-            cell.fill = row_fill
 
-        # On-Call Shifts - FROM ROTACLOUD (count of assigned on-call shifts)
-        cell = ws.cell(row=row_idx, column=on_call_shifts_col, value=data['on_call_shift_count'])
-        cell.border = thin_border
-        cell.number_format = number_format
-        if row_fill:
-            cell.fill = row_fill
-        
-        # On-Call Flat Rate
-        cell = ws.cell(row=row_idx, column=on_call_flat_rate_col, value=ON_CALL_FLAT_RATE)
-        cell.border = thin_border
-        cell.number_format = currency_format
-        if row_fill:
-            cell.fill = row_fill
-        
-        # Overtime Hrs - CALCULATED (bold)
-        # Formula: (Total Hrs - On-Call Hrs) - (Fixed Hrs - On-Call Hrs)
-        # Algebraically: Total - On-Call - Fixed + On-Call = Total - Fixed
-        # Working example: total_display=200, on-call=20, fixed=160
-        # Overtime = 200 - 20 - (160 - 20) = 180 - 140 = 40 ✓
-        # But wait, that's not Total - Fixed (which would be 40). Let me recalculate...
-        # (200 - 20) - (160 - 20) = 180 - 140 = 40
-        # Total - Fixed = 200 - 160 = 40 ✓
-        # They're the same! So overtime = Total displayed - Fixed
-        overtime_formula = f"=MAX(0,{get_column_letter(total_hrs_col)}{row_idx}-{get_column_letter(fixed_hrs_col)}{row_idx})"
-        cell = ws.cell(row=row_idx, column=overtime_hrs_col, value=overtime_formula)
-        cell.border = thin_border
-        cell.number_format = number_format
-        cell.font = Font(bold=True)  # Calculated value
-        if row_fill:
-            cell.fill = row_fill
-        
-        # Rate 2 (overtime rate)
-        cell = ws.cell(row=row_idx, column=rate2_col, value=overtime_rate)
-        cell.border = thin_border
-        cell.number_format = currency_format
-        if row_fill:
-            cell.fill = row_fill
-        
-        # Holiday Days
-        cell = ws.cell(row=row_idx, column=holiday_days_col, value=data['holiday_days'])
-        cell.border = thin_border
-        cell.number_format = number_format
-        if row_fill:
-            cell.fill = row_fill
-        
-        # Holiday Hours
-        cell = ws.cell(row=row_idx, column=holiday_hrs_col, value=data['holiday_hours'])
-        cell.border = thin_border
-        cell.number_format = number_format
-        if row_fill:
-            cell.fill = row_fill
-        
-        # Sickness Days
-        cell = ws.cell(row=row_idx, column=sickness_days_col, value=data['sickness_days'])
-        cell.border = thin_border
-        cell.number_format = number_format
-        if row_fill:
-            cell.fill = row_fill
-        
-        # TOTAL PAY formula - CALCULATED (bold)
-        # For salaried: simply annual salary / 12
-        # For hourly: (Hours * Rate1) + (Custom Role Hrs * Custom Rates) + (On-Call Hrs * Rate1) + (On-Call Shifts * Flat Rate) + (Overtime * Rate2) + (Holiday Hrs * Rate1)
-        # Formula structure: =(F*G)+(H*I)+(J*K)+(L*G)+(M*N)+(O*P)+(R*G)
+        # On-Call columns
+        styled_cell(row_idx, on_call_hrs_col, data['on_call_hours'], number_format, bold=True)
+        styled_cell(row_idx, on_call_shifts_col, data['on_call_shift_count'], number_format)
+        styled_cell(row_idx, on_call_flat_rate_col, ON_CALL_FLAT_RATE, currency_format)
 
+        # Training columns
+        styled_cell(row_idx, training_hrs_col, data['training_hours'], number_format, bold=True)
+        # Training Pay = Training Hrs × Rate 1 (calculated formula, bold)
+        training_pay_formula = (
+            f"={get_column_letter(training_hrs_col)}{row_idx}*{get_column_letter(rate1_col)}{row_idx}"
+        )
+        c = ws.cell(row=row_idx, column=training_pay_col, value=training_pay_formula)
+        c.border = thin_border
+        c.number_format = currency_format
+        c.font = Font(bold=True)
+        if row_fill:
+            c.fill = row_fill
+
+        # Overtime = MAX(0, Total - Fixed)
+        overtime_formula = (
+            f"=MAX(0,{get_column_letter(total_hrs_col)}{row_idx}"
+            f"-{get_column_letter(fixed_hrs_col)}{row_idx})"
+        )
+        c = ws.cell(row=row_idx, column=overtime_hrs_col, value=overtime_formula)
+        c.border = thin_border
+        c.number_format = number_format
+        c.font = Font(bold=True)
+        if row_fill:
+            c.fill = row_fill
+
+        styled_cell(row_idx, rate2_col, overtime_rate, currency_format)
+        styled_cell(row_idx, holiday_days_col, data['holiday_days'], number_format)
+        styled_cell(row_idx, holiday_hrs_col, data['holiday_hours'], number_format)
+        styled_cell(row_idx, sickness_days_col, data['sickness_days'], number_format)
+
+        # TOTAL PAY
         if is_salaried:
-            # Salaried staff: just use their monthly salary (annual / 12)
             monthly_salary = data['annual_salary'] / 12
-            cell = ws.cell(row=row_idx, column=total_pay_col, value=monthly_salary)
+            c = ws.cell(row=row_idx, column=total_pay_col, value=monthly_salary)
         else:
-            # Hourly staff: calculate based on hours worked
-            hours_letter = get_column_letter(hours_col)  # F - Hours (MIN formula)
-            rate1_letter = get_column_letter(rate1_col)  # G - Rate 1
-            on_call_hrs_letter = get_column_letter(on_call_hrs_col)  # L - On-Call Hrs
-            on_call_shifts_letter = get_column_letter(on_call_shifts_col)  # M - On-Call Shifts
-            on_call_flat_rate_letter = get_column_letter(on_call_flat_rate_col)  # N - On-Call Flat Rate
-            overtime_hrs_letter = get_column_letter(overtime_hrs_col)  # O - Overtime Hrs
-            rate2_letter = get_column_letter(rate2_col)  # P - Rate 2
-            holiday_hrs_letter = get_column_letter(holiday_hrs_col)  # R - Holiday Hrs
+            hours_letter          = get_column_letter(hours_col)
+            rate1_letter          = get_column_letter(rate1_col)
+            on_call_hrs_letter    = get_column_letter(on_call_hrs_col)
+            on_call_shifts_letter = get_column_letter(on_call_shifts_col)
+            on_call_flat_letter   = get_column_letter(on_call_flat_rate_col)
+            training_hrs_letter   = get_column_letter(training_hrs_col)
+            overtime_hrs_letter   = get_column_letter(overtime_hrs_col)
+            rate2_letter          = get_column_letter(rate2_col)
+            holiday_hrs_letter    = get_column_letter(holiday_hrs_col)
 
-            # Build custom role pay parts (H*I, J*K, etc.)
             custom_role_pay_parts = []
             col_offset = 0
             for role_id, role_name in sorted_roles:
-                hrs_col = custom_role_start_col + col_offset
-                rate_col = custom_role_start_col + col_offset + 1
-                hrs_letter = get_column_letter(hrs_col)
-                rate_letter = get_column_letter(rate_col)
-                custom_role_pay_parts.append(f"({hrs_letter}{row_idx}*{rate_letter}{row_idx})")
+                h = get_column_letter(custom_role_start_col + col_offset)
+                r = get_column_letter(custom_role_start_col + col_offset + 1)
+                custom_role_pay_parts.append(f"({h}{row_idx}*{r}{row_idx})")
                 col_offset += 2
 
             custom_role_pay_formula = "+".join(custom_role_pay_parts) if custom_role_pay_parts else ""
 
-            # Total pay formula: (Hours * Rate1) + Custom Roles + (On-Call Hrs * Rate1) + (On-Call Shifts * Flat Rate) + (Overtime * Rate2) + (Holiday * Rate1)
+            # Total = (Hours × Rate1) + Custom Roles + (On-Call Hrs × Rate1) + (On-Call Shifts × Flat)
+            #       + (Training Hrs × Rate1) + (Overtime × Rate2) + (Holiday Hrs × Rate1)
             total_pay_formula = f"=({hours_letter}{row_idx}*{rate1_letter}{row_idx})"
             if custom_role_pay_formula:
                 total_pay_formula += f"+{custom_role_pay_formula}"
             total_pay_formula += (
                 f"+({on_call_hrs_letter}{row_idx}*{rate1_letter}{row_idx})"
-                f"+({on_call_shifts_letter}{row_idx}*{on_call_flat_rate_letter}{row_idx})"
+                f"+({on_call_shifts_letter}{row_idx}*{on_call_flat_letter}{row_idx})"
+                f"+({training_hrs_letter}{row_idx}*{rate1_letter}{row_idx})"
                 f"+({overtime_hrs_letter}{row_idx}*{rate2_letter}{row_idx})"
                 f"+({holiday_hrs_letter}{row_idx}*{rate1_letter}{row_idx})"
             )
-            cell = ws.cell(row=row_idx, column=total_pay_col, value=total_pay_formula)
-        
-        # Apply formatting to total pay cell
-        cell.border = thin_border
-        cell.number_format = currency_format
-        cell.font = Font(bold=True)
+            c = ws.cell(row=row_idx, column=total_pay_col, value=total_pay_formula)
+
+        c.border = thin_border
+        c.number_format = currency_format
+        c.font = Font(bold=True)
         if row_fill:
-            cell.fill = row_fill
-    
-    # Add totals row
+            c.fill = row_fill
+
+    # Totals row
     last_data_row = data_start_row + len(payroll_data) - 1
     total_row = last_data_row + 1
-    
+
     cell = ws.cell(row=total_row, column=1, value="TOTALS")
     cell.font = Font(bold=True)
     cell.border = thin_border
-    
-    # Sum formulas for numeric columns
-    sum_columns = [weekly_hrs_col, total_hrs_col, fixed_hrs_col, hours_col]
 
-    # Add custom role hour columns to sum
+    sum_columns = [weekly_hrs_col, total_hrs_col, fixed_hrs_col, hours_col]
     col_offset = 0
     for role_id, role_name in sorted_roles:
-        sum_columns.append(custom_role_start_col + col_offset)  # Hours column
+        sum_columns.append(custom_role_start_col + col_offset)
         col_offset += 2
+    sum_columns.extend([
+        on_call_hrs_col, on_call_shifts_col,
+        training_hrs_col,
+        overtime_hrs_col,
+        holiday_days_col, holiday_hrs_col, sickness_days_col,
+        total_pay_col
+    ])
 
-    sum_columns.extend([on_call_hrs_col, on_call_shifts_col, overtime_hrs_col, holiday_days_col, holiday_hrs_col, sickness_days_col, total_pay_col])
-    
     for col in sum_columns:
         col_letter = get_column_letter(col)
         cell = ws.cell(row=total_row, column=col, value=f"=SUM({col_letter}{data_start_row}:{col_letter}{last_data_row})")
@@ -943,21 +861,20 @@ def create_payroll_excel(payroll_data, start_date, end_date, overtime_rate, all_
         if col == total_pay_col:
             cell.number_format = currency_format
             cell.fill = PatternFill("solid", fgColor="FFFF00")
-        elif col in [rate1_col, rate2_col, on_call_flat_rate_col] or (col >= custom_role_start_col and (col - custom_role_start_col) % 2 == 1):
+        elif col in [rate1_col, rate2_col, on_call_flat_rate_col]:
             cell.number_format = currency_format
         else:
             cell.number_format = number_format
-    
-    # Set row height for header
+
     ws.row_dimensions[2].height = 30
-    
+
     return wb
+
 
 # --- Main Report Generation ---
 if generate_report_button:
     st.info("Generating payroll export... this may take some time.")
     
-    # Convert dates
     start_str = start_date.strftime("%Y-%m-%d")
     end_str = end_date.strftime("%Y-%m-%d")
     start_ts = date_to_unix_timestamp(start_date)
@@ -968,7 +885,6 @@ if generate_report_button:
         st.error("Date conversion error.")
         st.stop()
     
-    # Test API connection
     with st.spinner("Testing API connection..."):
         try:
             test_resp = requests.get(USERS_BASE_URL, headers=HEADERS, params={"limit": 1}, timeout=10)
@@ -978,18 +894,14 @@ if generate_report_button:
             st.error(f"❌ API Connection Failed: {e}")
             st.stop()
     
-    # Fetch users
     all_users = get_rotacloud_users()
     if all_users is None:
         st.error("Failed to fetch user data.")
         st.stop()
     
-    # Pre-fetch all role names for quick lookup
     role_id_to_name = {}
-    
-    # Process each user
     payroll_data = []
-    all_custom_roles = {}  # Track all custom roles found {role_id: role_name}
+    all_custom_roles = {}
     progress_bar = st.progress(0, text="Processing users...")
     
     users_to_process = [u for u in all_users if u.get("id") not in ignored_user_ids]
@@ -1003,11 +915,9 @@ if generate_report_button:
         
         progress_bar.progress((idx + 1) / total_users, text=f"Processing {employee_name}...")
         
-        # Get pay details
         pay_details = get_user_pay_details(user)
         pay_type = pay_details["pay_type"]
         
-        # Get hourly rate (Rate 1)
         if pay_type == "hourly":
             rate_1 = pay_details["hourly_rate"]
         elif pay_type == "annual" and pay_details["standard_weekly_hours"] > 0:
@@ -1015,11 +925,9 @@ if generate_report_button:
         else:
             rate_1 = 0.0
         
-        # Calculate fixed hours for the period
         weekly_hours = pay_details["standard_weekly_hours"]
         fixed_hours = calculate_fixed_hours(weekly_hours, period_days)
         
-        # Fetch shifts and calculate hours by role (excluding On-Call)
         if DEBUG_MODE:
             st.write(f"\n---\n### 👤 Processing: **{employee_name}** (ID: {user_id})")
 
@@ -1028,64 +936,54 @@ if generate_report_button:
         if DEBUG_MODE:
             st.write(f"📅 **Fetched {len(shifts_json) if shifts_json else 0} shifts for {employee_name}**")
 
-        total_hours, base_rate_hours, custom_role_hours, on_call_shifts = calculate_shift_hours_by_role(
+        total_hours, base_rate_hours, custom_role_hours, on_call_shifts, training_hours = calculate_shift_hours_by_role(
             shifts_json, pay_details, rate_1, all_custom_roles, role_id_to_name
         )
 
         if DEBUG_MODE:
             st.write(f"📊 **Shift breakdown for {employee_name}:**")
-            st.write(f"   - Total hours (excl. On-Call): {total_hours}")
+            st.write(f"   - Total hours (excl. On-Call & Training): {total_hours}")
+            st.write(f"   - Training hours: {training_hours}")
             st.write(f"   - On-Call shifts found: {len(on_call_shifts)}")
 
-        # Track all custom roles found
         for role_id, role_data in custom_role_hours.items():
             if role_id not in all_custom_roles:
                 all_custom_roles[role_id] = role_data['name']
 
-        # Calculate On-Call hours if there are On-Call shifts
         on_call_hours = 0.0
         on_call_shift_count = 0
         if on_call_shifts:
             if DEBUG_MODE:
                 st.write(f"🚨 **Fetching attendance data for On-Call shifts...**")
-
             attendance_data = get_attendance_data(start_ts, end_ts, user_id)
-
             if DEBUG_MODE and attendance_data:
                 st.write(f"📋 **Fetched {len(attendance_data)} attendance records**")
                 st.json({"sample_attendance": attendance_data[0] if attendance_data else "No data"})
-
             on_call_hours, on_call_shift_count = calculate_on_call_hours(on_call_shifts, attendance_data)
-
             if DEBUG_MODE:
                 st.write(f"✅ **On-Call Result: {on_call_hours} hours from {on_call_shift_count} shifts**")
         elif DEBUG_MODE:
             st.write(f"ℹ️ No On-Call shifts for {employee_name}")
-        
-        # Keep on-call hours separate for payment calculation
-        # total_hours represents non-on-call working hours
-        # on_call_hours are paid separately
-        
-        # Fetch leave and calculate holiday and sickness
+
         leave_json = get_rotacloud_leave(start_str, end_str, user_id)
         holiday_days, holiday_hours, sickness_days = calculate_leave_hours(leave_json, start_date, end_date)
         
-        # Only include users with hours or holiday or sickness or on-call
-        if total_hours > 0 or holiday_hours > 0 or holiday_days > 0 or sickness_days > 0 or on_call_hours > 0:
+        if total_hours > 0 or holiday_hours > 0 or holiday_days > 0 or sickness_days > 0 or on_call_hours > 0 or training_hours > 0:
             payroll_data.append({
                 "employee_name": employee_name,
                 "pay_type": pay_type,
                 "annual_salary": pay_details["annual_salary"],
                 "hourly_rate": pay_details["hourly_rate"],
                 "weekly_hours": pay_details["standard_weekly_hours"],
-                "total_hours": total_hours,  # Non-on-call hours
-                "total_hours_display": total_hours + on_call_hours,  # Display total including on-call
+                "total_hours": total_hours,
+                "total_hours_display": total_hours + on_call_hours + training_hours,
                 "fixed_hours": fixed_hours,
                 "rate_1": round(rate_1, 2),
                 "base_rate_hours": base_rate_hours,
                 "custom_role_hours": custom_role_hours,
                 "on_call_hours": on_call_hours,
                 "on_call_shift_count": on_call_shift_count,
+                "training_hours": training_hours,
                 "holiday_days": holiday_days,
                 "holiday_hours": holiday_hours,
                 "sickness_days": sickness_days
@@ -1097,67 +995,56 @@ if generate_report_button:
         st.warning("No payroll data found for the selected period.")
         st.stop()
     
-    # Sort: Salaried staff first (alphabetically), then hourly staff (alphabetically)
     salaried_staff = [p for p in payroll_data if p['pay_type'] == 'annual']
     hourly_staff = [p for p in payroll_data if p['pay_type'] != 'annual']
-    
     salaried_staff.sort(key=lambda x: x['employee_name'].lower())
     hourly_staff.sort(key=lambda x: x['employee_name'].lower())
-    
     payroll_data = salaried_staff + hourly_staff
     
-    # Display preview
     st.subheader("📋 Payroll Preview")
     
-    # Show custom roles found
     if all_custom_roles:
         st.info(f"🏷️ **Custom Role Rates Found:** {', '.join(all_custom_roles.values())}")
     
-    # Build preview dataframe
     preview_rows = []
     for data in payroll_data:
-        # Calculate "Hours" - MIN(Total - On-Call, Fixed - On-Call)
-        # This represents the remaining fixed hours after accounting for on-call
-        # Example: MIN(200-20, 160-20) = MIN(180, 140) = 140
-        hours_worked = min(data['total_hours'], data['fixed_hours'] - data['on_call_hours'])
-
-        # Calculate overtime: (Total - On-Call) - (Fixed - On-Call) = Total displayed - Fixed
+        hours_worked = min(
+            data['total_hours'],
+            data['fixed_hours'] - data['on_call_hours'] - data['training_hours']
+        )
         overtime_hrs = max(0, data['total_hours_display'] - data['fixed_hours'])
 
         if data['pay_type'] == 'annual':
-            # Salaried: simply annual salary / 12
             total_pay = data['annual_salary'] / 12
         else:
-            # Hourly: NEW CALCULATION
-            # (Hours * Rate1) + Custom Roles + (On-Call Hrs * Rate1) + (On-Call Shifts * Flat Rate) + (Overtime * Rate2) + (Holiday * Rate1)
-            custom_role_pay = sum(
-                rd['hours'] * rd['rate'] for rd in data['custom_role_hours'].values()
-            )
-            base_pay = hours_worked * data['rate_1']
-            on_call_hours_pay = data['on_call_hours'] * data['rate_1']
-            on_call_shifts_pay = data['on_call_shift_count'] * ON_CALL_FLAT_RATE
-            overtime_pay = overtime_hrs * overtime_rate
-            holiday_pay = data['holiday_hours'] * data['rate_1']
-            total_pay = base_pay + custom_role_pay + on_call_hours_pay + on_call_shifts_pay + overtime_pay + holiday_pay
+            custom_role_pay = sum(rd['hours'] * rd['rate'] for rd in data['custom_role_hours'].values())
+            base_pay        = hours_worked * data['rate_1']
+            on_call_hrs_pay = data['on_call_hours'] * data['rate_1']
+            on_call_flat_pay = data['on_call_shift_count'] * ON_CALL_FLAT_RATE
+            training_pay    = data['training_hours'] * data['rate_1']
+            overtime_pay    = overtime_hrs * overtime_rate
+            holiday_pay     = data['holiday_hours'] * data['rate_1']
+            total_pay = base_pay + custom_role_pay + on_call_hrs_pay + on_call_flat_pay + training_pay + overtime_pay + holiday_pay
         
         row = {
             'Employee': data['employee_name'],
             'Type': 'Salaried' if data['pay_type'] == 'annual' else 'Hourly',
             'Weekly Hrs': data['weekly_hours'],
-            'Total Hrs': data['total_hours_display'],  # Show total including on-call
+            'Total Hrs': data['total_hours_display'],
             'Fixed Hrs': data['fixed_hours'],
             'Hours': hours_worked,
             'Rate 1 (£)': data['rate_1'],
         }
         
-        # Add custom role hours
         for role_id, role_name in sorted(all_custom_roles.items(), key=lambda x: x[1]):
             role_data = data['custom_role_hours'].get(role_id, {'hours': 0, 'rate': 0})
             row[f'{role_name} Hrs'] = role_data['hours']
         
-        row['On-Call Hrs'] = data['on_call_hours']
+        row['On-Call Hrs']   = data['on_call_hours']
         row['On-Call Shifts'] = data['on_call_shift_count']
-        row['Overtime Hrs'] = overtime_hrs
+        row['Training Hrs']  = data['training_hours']
+        row['Training Pay (£)'] = round(data['training_hours'] * data['rate_1'], 2)
+        row['Overtime Hrs']  = overtime_hrs
         row['Holiday (Days)'] = data['holiday_days']
         row['Holiday (Hrs)'] = data['holiday_hours']
         row['Sickness (Days)'] = data['sickness_days']
@@ -1168,34 +1055,33 @@ if generate_report_button:
     preview_df = pd.DataFrame(preview_rows)
     st.dataframe(preview_df, use_container_width=True)
     
-    # Summary metrics
-    total_pay_sum = sum(r['Total Pay (£)'] for r in preview_rows)
-    total_hours_sum = sum(r['Total Hrs'] for r in preview_rows)
-    total_on_call_hours_sum = sum(r['On-Call Hrs'] for r in preview_rows)
-    total_on_call_shifts_sum = sum(r['On-Call Shifts'] for r in preview_rows)
-    total_overtime_sum = sum(r['Overtime Hrs'] for r in preview_rows)
+    total_pay_sum          = sum(r['Total Pay (£)'] for r in preview_rows)
+    total_hours_sum        = sum(r['Total Hrs'] for r in preview_rows)
+    total_on_call_hrs_sum  = sum(r['On-Call Hrs'] for r in preview_rows)
+    total_on_call_shft_sum = sum(r['On-Call Shifts'] for r in preview_rows)
+    total_training_hrs_sum = sum(r['Training Hrs'] for r in preview_rows)
+    total_overtime_sum     = sum(r['Overtime Hrs'] for r in preview_rows)
     
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
     with col1:
         st.metric("Total Employees", len(payroll_data))
     with col2:
         st.metric("Total Hours", f"{total_hours_sum:.1f}")
     with col3:
-        st.metric("On-Call Hours", f"{total_on_call_hours_sum:.1f}")
+        st.metric("On-Call Hours", f"{total_on_call_hrs_sum:.1f}")
     with col4:
-        st.metric("On-Call Shifts", int(total_on_call_shifts_sum))
+        st.metric("On-Call Shifts", int(total_on_call_shft_sum))
     with col5:
+        st.metric("Training Hours", f"{total_training_hrs_sum:.1f}")
+    with col6:
         st.metric("Total Payroll", f"£{total_pay_sum:,.2f}")
     
-    # Create Excel file
     wb = create_payroll_excel(payroll_data, start_date, end_date, overtime_rate, all_custom_roles)
     
-    # Save to buffer
     excel_buffer = io.BytesIO()
     wb.save(excel_buffer)
     excel_buffer.seek(0)
     
-    # Download button
     filename = f"payroll_export_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}.xlsx"
     
     st.download_button(
@@ -1214,64 +1100,39 @@ else:
     st.markdown("""
     ### How it works:
 
-    1. **Total Hrs**: Actual hours worked from Rotacloud shifts (includes On-Call hours for display)
-    2. **Fixed Hrs**: Contracted weekly hours × (days in period ÷ 7) - **CALCULATED** (bold in export)
-    3. **Hours**: MIN(Total - On-Call, Fixed - On-Call) - **CALCULATED** (bold in export) - represents remaining fixed hours after on-call
-    4. **Rate 1**: Employee's hourly rate from Rotacloud (or calculated from annual salary)
-    5. **Custom Role Columns**: If staff have shifts with custom role rates, these appear as separate columns (e.g., Homecare, Mid-Shift)
-    6. **On-Call Hrs**: Hours actually worked on On-Call shifts - **CALCULATED** from Attendance (in_time - out_time) (bold in export)
-    7. **On-Call Shifts**: Number of On-Call shifts assigned (whether attended or not) from Rotacloud
-    8. **On-Call Flat Rate (£)**: Flat rate per On-Call shift (£15.00)
-    9. **Overtime Hrs**: Total - Fixed - **CALCULATED** (bold in export)
-    10. **Rate 2**: Overtime rate (default: UK minimum wage £12.21)
-    11. **Holiday**: Approved holiday days and hours from Rotacloud
+    1. **Total Hrs**: Actual hours worked from RotaCloud shifts (includes On-Call and Training hours)
+    2. **Fixed Hrs**: Contracted weekly hours × (days in period ÷ 7) — **CALCULATED** (bold)
+    3. **Hours**: MIN(Total - On-Call - Training, Fixed - On-Call - Training) — **CALCULATED** (bold)
+    4. **Rate 1**: Employee's hourly rate from RotaCloud (or derived from annual salary)
+    5. **Custom Role Columns**: Shifts with custom role rates appear as separate column pairs
+    6. **On-Call Hrs**: Hours worked on On-Call shifts — from Attendance API (in_time/out_time) — **CALCULATED** (bold)
+    7. **On-Call Shifts**: Count of assigned On-Call shifts (whether attended or not)
+    8. **On-Call Flat Rate (£)**: £15.00 per assigned On-Call shift
+    9. **Training Hrs**: Hours on Training-role shifts — from scheduled shift times — **CALCULATED** (bold)
+    10. **Training Pay (£)**: Training Hrs × Rate 1 — **CALCULATED** (bold)
+    11. **Overtime Hrs**: Total - Fixed — **CALCULATED** (bold)
+    12. **Rate 2**: Overtime rate (default: UK minimum wage £12.21)
+    13. **Holiday**: Approved holiday days and hours from RotaCloud
 
     ### Pay Calculation:
-    The new payment structure works as follows:
-    - **Hours** (remaining fixed after on-call) paid at **Rate 1**
-    - **Custom role hours** paid at their **custom rates**
-    - **On-Call hours** paid at **Rate 1** (employee's hourly rate)
-    - **On-Call shifts** paid at **£15.00 per shift** (flat rate, regardless of attendance)
-    - **Overtime hours** paid at **Rate 2** (minimum wage)
-    - **Holiday hours** paid at **Rate 1**
+    - **Hours** (remaining fixed after on-call and training) at **Rate 1**
+    - **Custom role hours** at their **custom rates**
+    - **On-Call hours** at **Rate 1** + **£15 flat rate per shift**
+    - **Training hours** at **Rate 1** (employee's own rate)
+    - **Overtime** at **Rate 2**
+    - **Holiday hours** at **Rate 1**
 
-    **Formula**: `=(Hours×Rate1) + (Custom Role Hrs×Custom Rates) + (On-Call Hrs×Rate1) + (On-Call Shifts×£15) + (Overtime Hrs×Rate2) + (Holiday Hrs×Rate1)`
+    **Formula**: `=(Hours×Rate1) + CustomRoles + (On-Call Hrs×Rate1) + (On-Call Shifts×£15) + (Training Hrs×Rate1) + (Overtime×Rate2) + (Holiday Hrs×Rate1)`
 
-    ### Key Logic:
-    - On-call hours reduce the available fixed hours when calculating base pay
-    - On-call hours are paid separately at the employee's standard rate
-    - On-call shifts are paid a flat rate even if not attended
-    - Overtime is calculated as: Total hours - Fixed hours
-    - **Bold text** in the Excel file indicates calculated/inferred values (not directly from Rotacloud)
+    ### Training vs On-Call:
+    - **Training** hours use scheduled shift times (start/end) — no attendance lookup needed
+    - **On-Call** hours use the Attendance API clock-in/out times
+    - Both are excluded from the base "Hours" column to avoid double-counting
+    - Training rows are highlighted in **light purple** (unless also On-Call, which takes priority)
 
-    ### Example:
-    Staff member: £14/hr, 40 weekly hrs, 4 weeks, 200 total hrs including 20 on-call hrs from 3 attended shifts (10 assigned on-call shifts)
-
-    **Breakdown:**
-    - Weekly hours: 40
-    - Fixed hours: 160 (40 × 4)
-    - Total hours: 200 (displayed)
-    - On-call hours: 20 (worked)
-    - Hours: MIN(200-20, 160-20) = MIN(180, 140) = 140 (remaining fixed after on-call)
-    - Overtime: 200 - 160 = 40 hrs
-    - On-call shifts: 10 (assigned)
-
-    **Payment:**
-    - Remaining fixed: 140 × £14 = £1,960
-    - On-call hours: 20 × £14 = £280
-    - On-call flat rate: 10 × £15 = £150
-    - Overtime: 40 × £12.21 = £488.40
-    - **Total: £2,878.40**
-
-    ### Staff Ordering:
-    - **Salaried staff** appear first (highlighted in green)
-    - **Hourly staff** appear after salaried staff
-    - Both groups sorted alphabetically
-
-    ### On-Call Shifts:
-    - On-Call shifts are identified by the "On-Call" role in Rotacloud
-    - Hours are calculated from the Attendance endpoint (in_time and out_time)
-    - All assigned On-Call shifts are counted for flat rate payment (not just attended)
-    - Rows with On-Call shifts are highlighted in yellow for easy identification
-
+    ### Row Highlighting:
+    - 🟡 **Yellow** — staff with On-Call shifts
+    - 🟣 **Purple** — staff with Training shifts only
+    - 🟢 **Green** — Salaried staff
+    - 🟠 **Orange** — Non-standard hourly rate
     """)
