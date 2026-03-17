@@ -624,10 +624,10 @@ def create_payroll_excel(payroll_data, start_date, end_date, overtime_rate, all_
         "On-Call Flat Rate (£)"
     ]
 
-    # Training columns — hours from scheduled shift times, paid at Rate 1
+    # Training columns — hours from scheduled shift times, paid at Rate 2 (£12.21)
     training_headers = [
         "Training Hrs",
-        "Training Pay (£)"  # Calculated: Training Hrs × Rate 1 (bold, formula)
+        "Training Pay (£)"  # Calculated: Training Hrs × Rate 2, bold, formula
     ]
     
     end_headers = [
@@ -677,7 +677,7 @@ def create_payroll_excel(payroll_data, start_date, end_date, overtime_rate, all_
     on_call_flat_rate_col = on_call_shifts_col + 1
 
     training_hrs_col  = on_call_flat_rate_col + 1
-    training_pay_col  = training_hrs_col + 1   # Calculated: Training Hrs × Rate 1
+    training_pay_col  = training_hrs_col + 1   # Calculated: Training Hrs × Rate 2
 
     overtime_hrs_col  = training_pay_col + 1
     rate2_col         = overtime_hrs_col + 1
@@ -759,9 +759,9 @@ def create_payroll_excel(payroll_data, start_date, end_date, overtime_rate, all_
 
         # Training columns
         styled_cell(row_idx, training_hrs_col, data['training_hours'], number_format, bold=True)
-        # Training Pay = Training Hrs × Rate 1 (calculated formula, bold)
+        # Training Pay = Training Hrs × Rate 2 (£12.21 minimum wage)
         training_pay_formula = (
-            f"={get_column_letter(training_hrs_col)}{row_idx}*{get_column_letter(rate1_col)}{row_idx}"
+            f"={get_column_letter(training_hrs_col)}{row_idx}*{get_column_letter(rate2_col)}{row_idx}"
         )
         c = ws.cell(row=row_idx, column=training_pay_col, value=training_pay_formula)
         c.border = thin_border
@@ -813,14 +813,14 @@ def create_payroll_excel(payroll_data, start_date, end_date, overtime_rate, all_
             custom_role_pay_formula = "+".join(custom_role_pay_parts) if custom_role_pay_parts else ""
 
             # Total = (Hours × Rate1) + Custom Roles + (On-Call Hrs × Rate1) + (On-Call Shifts × Flat)
-            #       + (Training Hrs × Rate1) + (Overtime × Rate2) + (Holiday Hrs × Rate1)
+            #       + (Training Hrs × Rate2) + (Overtime × Rate2) + (Holiday Hrs × Rate1)
             total_pay_formula = f"=({hours_letter}{row_idx}*{rate1_letter}{row_idx})"
             if custom_role_pay_formula:
                 total_pay_formula += f"+{custom_role_pay_formula}"
             total_pay_formula += (
                 f"+({on_call_hrs_letter}{row_idx}*{rate1_letter}{row_idx})"
                 f"+({on_call_shifts_letter}{row_idx}*{on_call_flat_letter}{row_idx})"
-                f"+({training_hrs_letter}{row_idx}*{rate1_letter}{row_idx})"
+                f"+({training_hrs_letter}{row_idx}*{rate2_letter}{row_idx})"
                 f"+({overtime_hrs_letter}{row_idx}*{rate2_letter}{row_idx})"
                 f"+({holiday_hrs_letter}{row_idx}*{rate1_letter}{row_idx})"
             )
@@ -1021,7 +1021,7 @@ if generate_report_button:
             base_pay        = hours_worked * data['rate_1']
             on_call_hrs_pay = data['on_call_hours'] * data['rate_1']
             on_call_flat_pay = data['on_call_shift_count'] * ON_CALL_FLAT_RATE
-            training_pay    = data['training_hours'] * data['rate_1']
+            training_pay    = data['training_hours'] * overtime_rate  # Rate 2 (£12.21)
             overtime_pay    = overtime_hrs * overtime_rate
             holiday_pay     = data['holiday_hours'] * data['rate_1']
             total_pay = base_pay + custom_role_pay + on_call_hrs_pay + on_call_flat_pay + training_pay + overtime_pay + holiday_pay
@@ -1043,7 +1043,7 @@ if generate_report_button:
         row['On-Call Hrs']   = data['on_call_hours']
         row['On-Call Shifts'] = data['on_call_shift_count']
         row['Training Hrs']  = data['training_hours']
-        row['Training Pay (£)'] = round(data['training_hours'] * data['rate_1'], 2)
+        row['Training Pay (£)'] = round(data['training_hours'] * overtime_rate, 2)  # Rate 2 (£12.21)
         row['Overtime Hrs']  = overtime_hrs
         row['Holiday (Days)'] = data['holiday_days']
         row['Holiday (Hrs)'] = data['holiday_hours']
@@ -1109,7 +1109,7 @@ else:
     7. **On-Call Shifts**: Count of assigned On-Call shifts (whether attended or not)
     8. **On-Call Flat Rate (£)**: £15.00 per assigned On-Call shift
     9. **Training Hrs**: Hours on Training-role shifts — from scheduled shift times — **CALCULATED** (bold)
-    10. **Training Pay (£)**: Training Hrs × Rate 1 — **CALCULATED** (bold)
+    10. **Training Pay (£)**: Training Hrs × Rate 2 (£12.21) — **CALCULATED** (bold)
     11. **Overtime Hrs**: Total - Fixed — **CALCULATED** (bold)
     12. **Rate 2**: Overtime rate (default: UK minimum wage £12.21)
     13. **Holiday**: Approved holiday days and hours from RotaCloud
@@ -1118,11 +1118,11 @@ else:
     - **Hours** (remaining fixed after on-call and training) at **Rate 1**
     - **Custom role hours** at their **custom rates**
     - **On-Call hours** at **Rate 1** + **£15 flat rate per shift**
-    - **Training hours** at **Rate 1** (employee's own rate)
+    - **Training hours** at **Rate 2** (£12.21 minimum wage — flat rate for all staff)
     - **Overtime** at **Rate 2**
     - **Holiday hours** at **Rate 1**
 
-    **Formula**: `=(Hours×Rate1) + CustomRoles + (On-Call Hrs×Rate1) + (On-Call Shifts×£15) + (Training Hrs×Rate1) + (Overtime×Rate2) + (Holiday Hrs×Rate1)`
+    **Formula**: `=(Hours×Rate1) + CustomRoles + (On-Call Hrs×Rate1) + (On-Call Shifts×£15) + (Training Hrs×Rate2) + (Overtime×Rate2) + (Holiday Hrs×Rate1)`
 
     ### Training vs On-Call:
     - **Training** hours use scheduled shift times (start/end) — no attendance lookup needed
